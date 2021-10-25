@@ -1,0 +1,358 @@
+---
+title: "Mark_Pax"
+author: "Yilu"
+date: "21/10/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+# set working directory
+```{r,message=FALSE}
+# set working path and creat directory
+data.path <- "./"; setwd(data.path) #create dir
+res.path    <- file.path(data.path, "Results")
+fig.path    <- file.path(data.path, "Figures")
+
+if (!file.exists(data.path)) { dir.create(data.path) }
+if (!file.exists(res.path)) { dir.create(res.path) }
+if (!file.exists(fig.path)) { dir.create(fig.path) }
+```
+# load packages
+```{r,message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(janitor)
+library(RColorBrewer)
+library(gridExtra)
+library(openxlsx)
+library(DESeq2)
+library(gplots)
+library(factoextra)
+library(GSVA)
+library(ggpubr)
+library(clusterProfiler)
+library(enrichplot)
+library(ComplexHeatmap)
+```
+# Prepare expression matrix
+```{r}
+exprSet<-read.table('/Users/yihuawang/Mark_Pax/all.id.txt',sep = '\t',header = T) %>%
+  select(1,7:35) %>% # remove W sample
+  dplyr::rename( 'Gene.stable.ID'='Geneid')
+annotation<-read.table('/Users/yihuawang/Mark_Pax/mart_export_human.txt',header = T,sep = '\t')
+exprSet<-merge(exprSet,annotation,by='Gene.stable.ID')
+colnames(exprSet)
+exprSet<-aggregate(x=exprSet[,2:30],by=list(exprSet$Gene.name),FUN=max)
+
+rownames(exprSet)<-exprSet$Group.1
+exprSet<-exprSet[-1,-1]
+colnames(exprSet)<-gsub('.bam','',colnames(exprSet))
+```
+
+# Prepare condition and coldata
+```{r}
+group_list<-read.xlsx('/Users/yihuawang/Mark_Pax/NovogeneCPETstudyWallis.xlsx')%>%
+  dplyr::slice( 8:n())%>%
+  row_to_names(row_number = 1)
+
+exprSet<-exprSet[,group_list$`Sample Name`] # change the order of sample
+condition_rna<-factor(c(rep('IPF_0',11),
+                        rep('IPF_8',8),
+                        rep('Control',10)))## make condition
+condition_rna
+
+
+coldata <- data.frame(row.names=colnames(exprSet), condition_rna)
+coldata
+```
+
+```{r}
+group_list<-read.xlsx('/Users/yihuawang/Mark_Pax/NovogeneCPETstudyWallis.xlsx')%>%
+  dplyr::slice( 8:n())%>%
+  row_to_names(row_number = 1)
+group_list<-group_list[-c(7,10,11),]
+exprSet<-exprSet[,group_list$`Sample Name`] # change the order of sample
+condition_rna<-factor(c(rep('IPF_0',8),
+                        rep('IPF_8',8),
+                        rep('Control',10)))## make condition
+condition_rna
+
+
+coldata <- data.frame(row.names=colnames(exprSet), condition_rna)
+coldata
+```
+
+# Prepare DEseq2 object
+```{r}
+dds <- DESeqDataSetFromMatrix(countData=exprSet, colData=coldata, design=~condition_rna)### create a matrix for further analysis
+nrow(dds)
+dds<-dds[rowSums(counts(dds))>30,] ## delete rows with all count less than 10 
+nrow(dds)
+dds <- DESeq(dds)
+res <- results(dds)
+dds_normalized<-counts(dds, normalized=TRUE)
+write.table(dds_normalized,file = file.path(res.path,"deseq2_normalized_count.txt"),sep = '\t',row.names = T,col.names = NA,quote = F )
+```
+# Distance heatmap
+```{r,fig.width=15, fig.height=15}
+# Sample distance heatmap
+rld <- rlog(dds, blind=FALSE)
+sampleDists <- as.matrix(dist(t(assay(rld))))
+(mycols <- brewer.pal(8, "Dark2")[1:length(unique(condition_rna))])
+heatmap.2(as.matrix(sampleDists), key=F, trace="none",
+          col=colorpanel(100,"#2c3a92","#b7d99e","#feffe1"),
+          ColSideColors=mycols[condition_rna], RowSideColors=mycols[condition_rna],
+          margin=c(10, 10), main="Sample Distance Matrix")
+legend("topright",      
+       legend = unique(condition_rna),
+       col = mycols, 
+       lty= 1,             
+       lwd = 5,           
+       cex=.7
+)
+pdf(file = file.path(fig.path,"qc-heatmap-samples.pdf"), width =10, height =10)
+heatmap.2(as.matrix(sampleDists), key=F, trace="none",
+          col=colorpanel(100,"#2c3a92","#b7d99e","#feffe1"),
+          ColSideColors=mycols[condition_rna], RowSideColors=mycols[condition_rna],
+          margin=c(10, 10), main="Sample Distance Matrix")
+legend("topright",      
+       legend = unique(condition_rna),
+       col = mycols, 
+       lty= 1,             
+       lwd = 5,           
+       cex=.7
+)
+dev.off()
+```
+
+# PCA
+
+```{r, fig.width=10, fig.height=20}
+data_t <- t(assay(rld))
+data_t<-data_t [ , which(apply(data_t , 2, var) != 0)] # delete col with constant/zero values
+variableL <- ncol(data_t)
+pca <- prcomp(data_t[,1:variableL], scale=T)
+data_t<-as.data.frame(data_t)
+data_t$conditions<-as.character(condition_rna)
+p <- list()
+a<-1
+for (i in 1:4){
+  for (j in (i+1):5){
+    p[[a]] <- fviz_pca_ind(pca, axes = c(i, j),col.ind=data_t$conditions, mean.point=F, addEllipses = T, legend.title="Dataset", title = "PCA - IBD_filter",
+                 geom.ind = "point")+scale_shape_manual(values=seq(0,17))+theme_classic()
+    a<-a+1
+  }
+}
+
+do.call(grid.arrange,c(p,ncol = 2))
+pdf(file.path(fig.path,'PCA.pdf'),width = 10,height = 20)
+do.call(grid.arrange,c(p,ncol = 2))
+dev.off()
+```
+
+# Geneset list
+```{r}
+Hypoxia_list<-list(c('NDRG1','ENO1','VEGFA','MRPS17','TPI1','CDKN3',
+                     'MIF','LDHA','ALDOA','TUBB6','PGAM1','SLC2A1','P4HA1','ACOT7','ADM'))
+REACTIVE_OXYGEN_SPECIES_PATHWAY<-read.xlsx('/Users/yihuawang/Mark_Pax/HALLMARK_REACTIVE_OXYGEN_SPECIES_PATHWAY.xlsx')
+REACTIVE_OXYGEN_SPECIES_PATHWAY<-list(REACTIVE_OXYGEN_SPECIES_PATHWAY$Gene)
+
+OXIDATIVE_PHOSPHORYLATION<-read.xlsx('/Users/yihuawang/Mark_Pax/HALLMARK_OXIDATIVE_PHOSPHORYLATION.xlsx')
+OXIDATIVE_PHOSPHORYLATION<-list(OXIDATIVE_PHOSPHORYLATION$Gene)
+group_list$Group<-condition_rna
+my_comparisons_train <- list(c('IPF_0','Control'),
+                             c('IPF_8','Control'),
+                             c('IPF_8','IPF_0'))
+
+```
+
+# GSVA_score_calculation
+```{r}
+GSVA_score_calculation<-function(geneset_list,ylabname){
+  group_list[`ylabname`]<- as.numeric(gsva((as.matrix(assay(rld))),geneset_list ,kcdf= "Gaussian", mx.diff=1))
+  print(ylabname)
+  p<-ggviolin(group_list,x = "Group", y = ylabname,
+         fill = "Group",
+         add = "boxplot", add.params = list(fill = "white"))+
+  scale_fill_brewer(palette="RdBu")+
+  stat_compare_means(comparisons = my_comparisons_train,size=10)+
+  ylab(paste0(ylabname," score","\n")) +
+  xlab('')+
+  #scale_y_continuous(breaks=seq(0, 1, 0.1))+
+  #coord_cartesian(ylim = c(-2500,3000))+
+  #geom_hline(yintercept = median(gsva_MYC_matrix[Purity_Test$Group=='MYCN_AMP',]$ImmuneScore), 
+  #          size=2,linetype = 2)+
+  theme_classic()+
+  theme(legend.position = "none",
+        axis.text.x = element_text(  size=30,color = 'black',hjust = 0.5,vjust=0),
+        axis.text.y = element_text( size=30,color = 'black'),
+        axis.line = element_line(colour = "black", size = 1, linetype = "solid"),
+        axis.title.y = element_text(color="black", size=40,vjust=0),
+        plot.margin = unit(c(1,1,1,1),"cm"))
+  plot(p)
+  ggsave(file.path(fig.path,paste0(ylabname," score",'.pdf')),width = 16,height = 12)
+}
+```
+
+# HIF score
+```{r,fig.width=10, fig.height=10}
+GSVA_score_calculation(Hypoxia_list,'HIF')
+```
+
+# Oxidative stress score
+```{r,fig.width=10, fig.height=10}
+GSVA_score_calculation(REACTIVE_OXYGEN_SPECIES_PATHWAY,'ROS')
+```
+# OXIDATIVE_PHOSPHORYLATION
+```{r,fig.width=10, fig.height=10}
+GSVA_score_calculation(OXIDATIVE_PHOSPHORYLATION,'OP')
+```
+
+```{r}
+write.table(group_list,file.path(res.path,'HIF_ROS_OP_score.txt'),sep = '\t',row.names = T,col.names = NA,quote = F )
+```
+
+# Heatmap of signature
+
+```{r}
+run_heatmap<-function(geneset_list,ylabname,widthvalue,heightvalue){
+  colorbar<-colorRampPalette(c('royalblue3','gray92','firebrick2'))(n=1000)
+  heatmap_matrix<-t(na.omit(exprSet[geneset_list[[1]],]))
+  n=t(scale(heatmap_matrix)) # 'scale'log-ratio
+  pdf(file.path(fig.path,paste0(ylabname," heatmap",'.pdf')), width = widthvalue, height = heightvalue)
+  ha = HeatmapAnnotation(`Group` =group_list[,10],
+                         col = list(`Group` = c('Control' = "#7CAE00",
+                                                            'IPF_0'='#00BFC4','IPF_8'='#C77CFF')),
+                         annotation_legend_param = list(
+                           `Group` = list(title = "Group")))
+  ht<-draw(Heatmap(n, name = "Value", #column_split = 2,
+                   column_title= ylabname,
+                   clustering_distance_columns = "euclidean",
+                   show_row_names = T,show_column_names  = T,
+                   top_annotation = ha,col=colorbar,show_heatmap_legend = T,
+                   column_dend_reorder = TRUE,
+                   show_parent_dend_line = FALSE),padding = unit(c(2, 2, 2, 2), "cm"))
+  dev.off()
+  ht
+  
+}
+```
+
+
+```{r,fig.width=10, fig.height=10 }
+run_heatmap(Hypoxia_list,'HIF',8,6)
+```
+
+```{r,fig.width=10, fig.height=15 }
+run_heatmap(REACTIVE_OXYGEN_SPECIES_PATHWAY,'ROS',8,12)
+```
+
+```{r,fig.width=10, fig.height=25 }
+run_heatmap(OXIDATIVE_PHOSPHORYLATION,'OP',8,24)
+```
+
+#GSEA analysis
+```{r}
+run_GSEA<-function(conditionA,conditionB,geneset){
+  res_conditionA_conditionB<-results(dds, contrast=c("condition_rna",conditionA,conditionB)) %>%
+    as.data.frame()
+  geneList<-res_conditionA_conditionB[order(res_conditionA_conditionB$log2FoldChange,decreasing = T),]$log2FoldChange
+  names(geneList) <- rownames(res_conditionA_conditionB[order(res_conditionA_conditionB$log2FoldChange,decreasing = T),])
+  MSigDB.hallmark=read.gmt(geneset)
+  gsea.conditionA.conditionB <- GSEA(geneList = geneList,
+                  TERM2GENE = MSigDB.hallmark,
+                  pvalueCutoff = 0.25,
+                  eps = 0,
+                  seed = T,
+                  verbose = F)
+  write.table(as.data.frame(gsea.conditionA.conditionB),file.path(res.path,paste0("GSEA plot for hallmark ",conditionA,  ' vs ',conditionB,".txt")),sep = "\t",row.names = F,quote = F)
+
+  up.path <- gsea.conditionA.conditionB[which(gsea.conditionA.conditionB$NES > 0),]; up.path <- up.path[order(up.path$NES,decreasing =   T),]
+  dn.path <- gsea.conditionA.conditionB[which(gsea.conditionA.conditionB$NES < 0),]; dn.path <- dn.path[order(dn.path$NES,decreasing =   F),]
+  mycol <- brewer.pal(n = 10, name = "Spectral")
+  p <- list()
+  if (length(up.path[,1])>5){
+    upid <- up.path$ID[1:5]
+    p[[1]]<-gseaplot2(x = gsea.conditionA.conditionB,
+            geneSetID = upid,
+            color = mycol[1:5])
+  }else{
+    upid <- up.path$ID
+    p[[1]]<-gseaplot2(x = gsea.conditionA.conditionB,
+            geneSetID = upid,
+            color = mycol[1:length(up.path[,1])])
+  }
+  if (length(dn.path[,1])>5){
+    
+    dnid <- dn.path$ID[1:5]
+    p[[2]]<-gseaplot2(x = gsea.conditionA.conditionB,
+            geneSetID = dnid,
+            color = mycol[1:5])
+  }else{
+    dnid <- dn.path$ID
+    p[[2]]<-gseaplot2(x = gsea.conditionA.conditionB,
+            geneSetID = dnid,
+            color = rev(mycol)[1:length(dn.path[,1])])
+  }
+  do.call(grid.arrange,c(p,nrow = 2))
+  pdf(file.path(fig.path,paste0("GSEA plot for hallmark ",conditionA,  ' vs ',conditionB,".pdf")),width = 5,height = 10)
+  do.call(grid.arrange,c(p,nrow = 2))
+  dev.off()
+}
+```
+
+
+```{r,height=10}
+run_GSEA('IPF_8','IPF_0','h.all.v7.4.symbols.gmt')
+```
+
+```{r,height=10}
+run_GSEA('IPF_8','Control','h.all.v7.4.symbols.gmt')
+```
+
+```{r,height=10}
+run_GSEA('IPF_0','Control','h.all.v7.4.symbols.gmt')
+```
+
+
+# GM score
+###```{r}
+gm_mean = function(x, na.rm=TRUE, zero.propagate = FALSE){
+  if(any(x < 0, na.rm = TRUE)){
+    return(NaN)
+  }
+  if(zero.propagate){
+    if(any(x == 0, na.rm = TRUE)){
+      return(0)
+    }
+    exp(mean(log(x), na.rm = na.rm))
+  } else {
+    exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+  }
+}
+
+
+group_list$GM<-apply(as.matrix(assay(rld))[c('NDRG1','ENO1','VEGFA','MRPS17','TPI1','CDKN3',
+                     'MIF','LDHA','ALDOA','TUBB6','PGAM1','SLC2A1','P4HA1','ACOT7','ADM'),],2,gm_mean) ## add GM of subgoup1 postive
+ggviolin(group_list, x = "Group", y = 'GM',
+         fill = "Group",
+         add = "boxplot", add.params = list(fill = "white"))+
+  scale_fill_brewer(palette="RdBu")+
+  ylab("GM score\n") +
+  xlab('')+
+  stat_compare_means(comparisons = my_comparisons_train,size=10)+
+  #scale_y_continuous(breaks=seq(0, 1, 0.1))+
+  #coord_cartesian(ylim = c(-2500,3000))+
+  #geom_hline(yintercept = median(gsva_MYC_matrix[Purity_Test$Group=='MYCN_AMP',]$ImmuneScore), 
+  #          size=2,linetype = 2)+
+  theme_classic()+
+  theme(legend.position = "none",
+        axis.text.x = element_text(  size=30,color = 'black',hjust = 0.5,vjust=0),
+        axis.text.y = element_text( size=30,color = 'black'),
+        axis.line = element_line(colour = "black", size = 1, linetype = "solid"),
+        axis.title.y = element_text(color="black", size=40,vjust=0),
+        plot.margin = unit(c(1,1,1,1),"cm"))
+ggsave(file.path(fig.path,'HIF_GM_score.pdf'),width = 16,height = 12)
+###```
+
